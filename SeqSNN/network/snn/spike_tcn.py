@@ -11,6 +11,7 @@ from ...module.basic_transform import Chomp2d
 from ...module.positional_encoding import PositionEmbedding
 from ...module.spike_encoding import SpikeEncoder
 from ..base import NETWORKS
+from .spike_attention import TemporalAwareSpikeAttention
 
 
 class SpikeTemporalBlock2D(nn.Module):
@@ -105,14 +106,14 @@ class SpikeTemporalBlock2D(nn.Module):
         else:
             res = self.downsample(x)
         spk_rec3 = []
-        for _ in range(self.num_steps):
+        for t in range(self.num_steps):  # 比如 num_steps=4
             spk = self.lif(spks2 + res)
+            # print(f"[time step {t}] spk shape = {spk.shape}")[time step 0] spk shape = torch.Size([64, 16, 330, 12])
             spk_rec3.append(spk)
 
-        res = torch.stack(spk_rec3, dim=-1)  # res: B, H, C, L, T
-        res = res.mean(-1)
-
-        return res
+        res_all_steps = torch.stack(spk_rec3, dim=-1)  # [B,H,C,L,T]
+        res_rate = res_all_steps.mean(-1)  # [B,H,C,L]
+        return res_rate, res_all_steps
 
 
 @NETWORKS.register_module("SNN_TCN2D")
@@ -136,6 +137,8 @@ class SpikeTemporalConvNet2D(nn.Module):
         pe_type: str = "none",
         pe_mode: str = "concat",  # "add" or "concat"
         neuron_pe_scale: float = 1000.0,  # "100" or "1000" or "10000"
+        tau: float = 1.0,
+        lambda_mix: float = 0.5,
     ):
         """
         Args:
@@ -180,6 +183,14 @@ class SpikeTemporalConvNet2D(nn.Module):
             ]
 
         self.network = nn.Sequential(*layers)
+
+        self.temporal_attn = TemporalAwareSpikeAttention(
+            d_model=input_size if input_size else hidden_size,
+            n_heads=6,
+            num_steps=num_steps,
+            use_first_spike=False  # True 表示用 first_spike_t 机制
+        )
+
         if (self.pe_type == "neuron" and self.pe_mode == "concat") or (
             self.pe_type == "random" and self.pe_mode == "concat"
         ):
@@ -192,13 +203,35 @@ class SpikeTemporalConvNet2D(nn.Module):
         for layer in self.network:
             utils.reset(layer)
 
-        inputs = self.encoder(inputs)  # B, H, C, L
+        inputs = self.encoder(inputs)  # [B,H,C,L]
         if self.pe_type != "none":
-            # B, H, C, L -> H B L C' -> B H C' L
             inputs = self.pe(inputs.permute(1, 0, 3, 2)).permute(1, 0, 3, 2)
-        spks = self.network(inputs)
-        spks = spks.squeeze(1)  # B, C', L
-        return spks, spks[:, :, -1]  # [B, C', L], [B, C']
+
+        # 遍历 TCN 网络
+        spks_rate, spks_time_series = None, None
+        x = inputs
+        for i, layer in enumerate(self.network):
+            x_rate, x_time = layer(x)
+            x = x_rate  # 给下一层输入
+            if i == len(self.network) - 1:  # 最后一层
+                spks_rate, spks_time_series = x_rate, x_time
+
+        # spks_rate: [B,H,C,L]
+        # spks_time_series: [B,H,C,L,T]
+
+        spks = spks_rate.squeeze(1)  # [B,C,L]
+
+        # reshape 给注意力
+        B, C, L = spks.shape
+        attn_in = spks.permute(0, 2, 1)  # [B,L,C]
+
+        # 传入逐时间步脉冲序列
+        attn_out = self.temporal_attn(attn_in, spks_time_series)
+
+        # 转回 [B,C,L]
+        attn_out = attn_out.permute(0, 2, 1)
+
+        return attn_out, attn_out[:, :, -1]
 
     @property
     def output_size(self):
